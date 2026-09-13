@@ -55,7 +55,7 @@ sources), and ghostscript-10.07.1.tar.xz (complete corresponding Ghostscript
 source). These files are outside the app to keep its installed size small.
 Source and binary SHA-256 hashes are recorded in versions.json. Redistribute
 these notices, source archives and build instructions together with the app.
-No GitHub upload or external publication was performed for this release.
+Release downloads: https://github.com/dkwage/PDF-print-for-macOS/releases
 
 ## 아이콘 / Artwork
 
