@@ -1,110 +1,88 @@
-# PDFPrinter — virtual PDF printer for macOS
+# PDF Printer
 
 [한국어 README](README.md)
 
-Choose **PDF Printer** in another app's print dialog to save a PDF in `~/PDFPrints`
-and reveal it in Finder. The original menu bar interface is retained. Python and
-Ghostscript are bundled: recipients need no Python, Homebrew, virtual environment
-or internet connection.
+Menu bar virtual PDF printer. Saves print jobs to `~/PDFPrints` and reveals them in Finder.
+Python and Ghostscript included. No Python, Homebrew or virtual environment installation needed.
 
-## Install and use
+## How it works
 
-1. Extract the release ZIP.
-2. Move **PDFPrinter.app** to **Applications**.
-3. Launch it and look for the printer icon in the menu bar.
-4. In another app, press `⌘P`, select **PDF Printer**, and print.
+```
+App (print) → macOS CUPS → ipp://127.0.0.1:6310 (this app's IPP server)
+            → save PDF / convert PS with bundled Ghostscript → reveal in Finder
+```
 
-This is a menu bar app: its Dock icon is deliberately hidden. Finder and Get Info
-use the custom application icon. Documentation, notices and sources are in the ZIP’s separate `distribution/` folder.
-Only the app is needed for installation; redistribute the complete ZIP including
-`distribution/` when sharing with others.
+- Registers the "PDF Printer" queue through `lpadmin` on launch (IPP Everywhere)
+- Removes only the queue created by this run on stop/quit
+- Binds to 127.0.0.1. Printing available only while the app is running
+- Repeated job titles do not overwrite existing files
+- Failed PS conversion retains the `.ps` original. Unsupported data retained as `.bin`
 
-- **프린터 정지 / 프린터 시작**: stop/start the server and its printer queue.
-- **저장 폴더 열기**: open the output folder.
-- **종료**: stop and remove only the queue created by this app run.
-- **!** beside the icon means stopped; startup failures appear in a dialog.
+## Install and run
 
-Output filenames include the title, timestamp and unique suffix. Existing files
-are never overwritten. PostScript is converted by bundled Ghostscript. Failed
-conversion retains `.ps` and returns a printing error; unsupported data is
-retained as `.bin`. Interrupted saves may leave `.incoming` files.
+1. Extract the release ZIP
+2. Move `PDFPrinter.app` to Applications and launch
+3. In another app, press `⌘P` → select **PDF Printer** → print
 
-## Signing and Gatekeeper
+Printer icon in the menu bar. Menu: stop/start printer, open output folder, quit.
+Menu labels are in Korean. `!` beside the icon means stopped. No Dock icon.
 
-This local release is **ad-hoc signed only**, **not Developer ID signed and not
-Apple notarized**. Downloads may be blocked by Gatekeeper. If you trust the source,
-try launching once, then use **System Settings → Privacy & Security → Open Anyway**.
-Managed Macs may require an administrator. Do not disable system-wide security.
+Current build: **ad-hoc signed only. No Developer ID signature or Apple notarization.**
+If blocked, verify the source, then use System Settings → Privacy & Security → Open Anyway.
+Contact your administrator if blocked by organization policy.
 
 ## Supported systems and limitations
 
-- **Apple Silicon (arm64), macOS 14 Sonoma or later**. No Intel build is included.
-- Tested on **macOS 26.6.2 / arm64**; macOS 14/15 and other physical Macs are untested.
-- Requires a logged-in user and permission to manage CUPS printers. Restricted
-  accounts may reject automatic queue registration. The app does not collect
-  passwords or silently elevate privileges.
-- Listens only on `127.0.0.1:6310`, while running. No login-item installation.
-- PDF and PostScript, up to 512 MiB per job, 30-second socket read timeout and
-  120-second PostScript conversion timeout. Intended for ordinary single-document
-  printing; advanced job management, multi-document jobs and all IPP operations
-  are not implemented.
-- An existing `pdf_printer` queue is refused to protect its settings. Check in
-  System Settings whether it is a stale queue from a previous run before manually
-  removing it. Force quitting or system shutdown may leave a queue behind.
-  Other printers and saved PDFs are not automatically removed.
-- PostScript without embedded fonts may use bundled substitutes; review important
-  documents. DRM, print restrictions and certificate security modules are not
-  bypassed. The historical ICerti compatibility claim was not revalidated here.
+- Apple Silicon (arm64), macOS 14 Sonoma or later. No Intel support
+- Requires a logged-in user session and permission to manage CUPS printers
+- Refuses registration if `pdf_printer` already exists. Check whether it is a stale queue from an earlier run before manually removing it
+- Force quitting may leave the queue behind. Saved PDFs are not automatically deleted
+- Single-document PDF/PostScript printing. Maximum 512 MiB per job, 30-second read timeout, 120-second PS conversion timeout
+- PS without embedded fonts may use substitutes. No DRM or secure-print restriction bypass
 
-## Build from source (developers only)
+## Verified printing environments
 
-Requires an Apple Silicon Mac, Python 3.11, Xcode Command Line Tools
-(`xcode-select --install`) and internet for initial dependencies. This release
-uses python-build-standalone CPython 3.11.15.
+- macOS 26.6.2 / Apple Silicon: real CUPS printing, PDF saving, PS conversion, concurrent jobs, stop/restart
+- App copied alone to a temporary folder, with development source, Python and Homebrew paths blocked
+- macOS 14/15 and other Macs have not been tested on hardware
+- Inha University certificate service (ICerti): reported use with the previous version. Not revalidated with this version
+
+## Run and build from source
+
+Developers only: Python 3.11, Xcode Command Line Tools and internet for initial downloads.
 
 ```bash
+xcode-select --install  # If Command Line Tools are missing
 bash build.sh
 ```
 
-This creates a project-local `.build-venv`, installs pinned dependencies, verifies
-the Ghostscript source SHA-256, builds it with vendored libraries and freezes the
-runtime using PyInstaller. Existing build/dist directories are not wiped. A fresh
-timestamped app, ZIP and SHA-256 file are produced under `packages/`. When building from bundled source.zip, place the
-accompanying ghostscript-10.07.1.tar.xz in the extracted source's vendor/ directory
-to skip that download.
-Icons and their originals are in `macos/`; `macos/make_icons.py` regenerates PNG
-sizes and the menu glyph. Existing ICNS is retained; remove that generated ICNS
-explicitly if you want to regenerate it from changed artwork.
+Install dependencies in `.build-venv` → download, verify and build Ghostscript → freeze the app with PyInstaller.
+Outputs: `.app`, release ZIP and SHA-256 file under `packages/`.
 
 ```bash
-.build-venv/bin/python build_macos_app.py  # dependencies/Ghostscript already built
-.build-venv/bin/python verify_distribution.py  # isolated app, denied dev paths, CUPS/UI
-.build-venv/bin/python app.py             # source execution
-.build-venv/bin/python app.py --self-test  # real CUPS, unique temporary queue/files
-.build-venv/bin/python app.py --ui-smoke-test  # native menu, stop/start/quit
+.build-venv/bin/python app.py                       # Run source after build setup
+.build-venv/bin/python app.py --self-test           # Print checks with temporary files/unique queue
+.build-venv/bin/python verify_distribution.py       # Latest ZIP: isolated app, CUPS and menu UI checks
 ```
 
-Builds receive an ad-hoc signature. Developer ID signing and notarization are
-not automated. For a notarized release, sign nested binaries and the app using
-Apple Developer credentials, submit using notarytool, staple, recreate the ZIP
-and verify that separate release.
+## Distribution and license
 
-## License and source
+App size: approximately **42.5 MiB**. Sources and licenses are outside the app, in the release ZIP's `distribution/` folder.
+Move only the app to install. Share the complete ZIP, including `distribution/`, when redistributing.
 
-This local distribution is **AGPL-3.0-or-later**. The baseline repository had no
-separate license file; this distribution adds [LICENSE](LICENSE) and
-[attribution/dependency notices](NOTICE.md). Ghostscript is used under AGPL,
-without a commercial license.
+[AGPL-3.0-or-later](LICENSE). Includes Ghostscript source and dependency notices. See [NOTICE.md](NOTICE.md).
+Track only source, build files, icons and licenses in Git. ZIP/SHA-256 files are GitHub Releases attachments.
+Virtual environments, build caches, binaries and downloaded source archives are excluded from Git.
 
-The release ZIP’s `distribution/` includes complete app/build/icon sources in
-source.zip, the complete Ghostscript source tarball, licenses, documentation and
-hashes. Keep these together when redistributing. No GitHub publication was made.
+## Files
 
-## GitHub files
-
-Commit source/build/check scripts, requirements, READMEs, LICENSE, NOTICE,
-LICENSES/, icon originals/ICNS/menu PNG/generator in macos/, and vendor/ghostscript.sha256.
-Attach the final ZIP and SHA-256 from packages/ to **GitHub Releases**, not Git.
-Exclude virtual environments, build caches, old dist, downloaded Ghostscript source,
-compiled Ghostscript, .DS_Store and generated iconsets. Commit the deletions of
-previously tracked build/dist artifacts as part of this cleanup.
+| File | Purpose |
+| --- | --- |
+| `app.py` | Menu bar app + IPP server + conversion + queue registration |
+| `build.sh` | Prepare dependencies → build Ghostscript → create app/ZIP |
+| `build_ghostscript.sh` | Download, verify and build Ghostscript source |
+| `build_macos_app.py`, `PDFPrinter.spec` | Bundle runtime and assemble release package |
+| `requirements.txt`, `requirements-build.txt` | Runtime/build dependencies |
+| `selftest.py`, `verify_distribution.py` | Real printing and standalone execution checks |
+| `macos/` | Original app icon, ICNS, menu icon and generation script |
+| `LICENSE`, `LICENSES/`, `NOTICE.md` | Project/dependency licenses and copyright notices |
