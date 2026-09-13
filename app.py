@@ -12,7 +12,10 @@ import datetime
 import pathlib
 import re
 import shutil
-import socket
+import os
+import sys
+import logging
+import uuid
 import subprocess
 import tempfile
 import threading
@@ -22,7 +25,8 @@ import struct
 import rumps
 from ippserver.server import IPPServer, IPPRequestHandler
 from ippserver.behaviour import SaveFilePrinter
-from ippserver.constants import SectionEnum, TagEnum
+from ippserver.constants import SectionEnum, TagEnum, StatusCodeEnum
+from ippserver.request import IppRequest
 
 APP_NAME = "PDFPrinter"
 PRINTER_QUEUE = "pdf_printer"        # lpadmin 큐 이름 (공백 불가)
@@ -33,12 +37,16 @@ OUT_DIR = pathlib.Path("~/PDFPrints").expanduser()
 
 # ---------- 유틸 ----------
 
+RESOURCE_DIR = pathlib.Path(getattr(sys, "_MEIPASS", pathlib.Path(__file__).resolve().parent))
+
+
 def find_gs():
-    for p in ("gs", "/opt/homebrew/bin/gs", "/usr/local/bin/gs"):
-        w = shutil.which(p)
-        if w:
-            return w
-    return None
+    bundled = RESOURCE_DIR / "ghostscript" / "gs"
+    if bundled.is_file():
+        return str(bundled)
+    if not getattr(sys, "frozen", False):
+        return shutil.which("gs")
+    raise RuntimeError("앱에 포함된 Ghostscript가 없습니다. 앱을 다시 설치하세요.")
 
 
 GS = find_gs()
@@ -49,9 +57,9 @@ def job_title(ipp_request):
         for (_, name, _), values in ipp_request._attributes.items():
             if name in (b"job-name", b"document-name") and values:
                 t = values[0].decode("utf-8", "replace")
-                t = re.sub(r'[/\\:*?"<>|]', "_", t).strip()
+                t = re.sub(r'[/\\:*?"<>|\x00-\x1f\x7f]', "_", t).strip(' .')
                 if t:
-                    return t[:80]
+                    return t.encode("utf-8")[:160].decode("utf-8", "ignore")
     except Exception:
         pass
     return None
@@ -135,46 +143,141 @@ def everywhere_attributes(port):
 # ---------- 프린터 동작 ----------
 
 class PdfConvertPrinter(SaveFilePrinter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.base_uri = f"ipp://127.0.0.1:{PORT}/".encode()
+        self.printer_uri = self.base_uri + b"ipp/print"
+
     def printer_list_attributes(self):
         attr = super().printer_list_attributes()
         attr.update(everywhere_attributes(PORT))
         return attr
 
-    def filename(self, ipp_request):
+    def handle_postscript(self, ipp_request, postscript_file):
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         title = job_title(ipp_request) or "print-job"
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        base = OUT_DIR / f"{title}-{ts}"
-        p, n = base.with_suffix(".pdf"), 1
-        while p.exists():
-            p = base.with_name(f"{base.name}-{n}").with_suffix(".pdf")
-            n += 1
-        return str(p)
+        # mkstemp reserves the filename atomically, including concurrent jobs.
+        fd, name = tempfile.mkstemp(prefix=f"{title}-{ts}-", suffix=".incoming", dir=OUT_DIR)
+        path = pathlib.Path(name)
+        with os.fdopen(fd, "wb") as output:
+            shutil.copyfileobj(postscript_file, output)
+        self.run_after_saving(path, ipp_request)
 
     def run_after_saving(self, filename, ipp_request):
         path = pathlib.Path(filename)
-        with open(path, "rb") as f:
-            head = f.read(8)
+        with path.open("rb") as source:
+            head = source.read(8)
+        if head.startswith(b"%PDF-"):
+            suffix = ".pdf"
+        elif head.startswith(b"%!PS"):
+            try:
+                if not GS:
+                    raise RuntimeError("Ghostscript를 찾을 수 없습니다")
+                with tempfile.TemporaryDirectory(prefix="pdfprinter-") as work:
+                    converted = pathlib.Path(work) / "converted.pdf"
+                    result = subprocess.run(
+                        [GS, "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
+                         "-sDEVICE=pdfwrite", f"-sOutputFile={converted}", str(path)],
+                        capture_output=True, timeout=120,
+                        env={k: v for k, v in os.environ.items()
+                             if not k.startswith(("GS_", "DYLD_"))},
+                    )
+                    if result.returncode or not converted.is_file():
+                        raise RuntimeError(result.stderr.decode("utf-8", "replace")[-1000:])
+                    with converted.open("rb") as check:
+                        if not check.read(5) == b"%PDF-":
+                            raise RuntimeError("PDF 변환 결과가 올바르지 않습니다")
+                    # Publish exclusively; preserve the incoming original on failure.
+                    destination = self.publish(converted, path.with_suffix(".pdf"))
+                path.unlink()
+                self.saved(destination)
+                return
+            except Exception as error:
+                destination = self.publish(path, path.with_suffix(".ps"))
+                path.unlink()
+                notify("변환 실패", f"PostScript 원본 보존: {destination.name}")
+                raise RuntimeError(f"PostScript 변환 실패: {error}") from error
+        else:
+            destination = self.publish(path, path.with_suffix(".bin"))
+            path.unlink()
+            raise ValueError(f"지원하지 않는 인쇄 데이터. 원본 보존: {destination.name}")
+        destination = self.publish(path, path.with_suffix(suffix))
+        path.unlink()
+        self.saved(destination)
 
-        if head.startswith(b"%!PS"):
-            if GS:
-                tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-                tmp.close()
-                r = subprocess.run(
-                    [GS, "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
-                     "-sDEVICE=pdfwrite", f"-sOutputFile={tmp.name}", str(path)],
-                    capture_output=True,
-                )
-                if r.returncode == 0:
-                    shutil.move(tmp.name, path)
-                else:
-                    pathlib.Path(tmp.name).unlink(missing_ok=True)
-                    notify("변환 실패", "PostScript 원본으로 저장됨")
-            else:
-                notify("Ghostscript 없음", "PS 원본 저장. brew install ghostscript")
+    @staticmethod
+    def publish(source, destination):
+        while True:
+            try:
+                output = destination.open("xb")
+                break
+            except FileExistsError:
+                destination = destination.with_name(f"{destination.stem}-{uuid.uuid4().hex[:8]}{destination.suffix}")
+        with output, source.open("rb") as incoming:
+            shutil.copyfileobj(incoming, output)
+        return destination
 
+    def saved(self, path):
         notify("PDF 저장 완료", path.name)
-        subprocess.run(["open", "-R", str(path)])   # Finder에서 표시
+        try:
+            subprocess.run(["/usr/bin/open", "-R", str(path)], timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            logging.exception("Finder 표시 실패; PDF는 저장되었습니다")
+
+
+class RequestHandler(IPPRequestHandler):
+    """Bound HTTP bodies: upstream 0.2 otherwise waits for EOF on keep-alive jobs."""
+    def parse_request(self):
+        from http.server import BaseHTTPRequestHandler
+        result = BaseHTTPRequestHandler.parse_request(self)
+        self.close_connection = True
+        self.connection.settimeout(30)
+        return result
+
+    def handle_expect_100(self):
+        self.send_response_only(100)
+        self.end_headers()
+        return True
+
+    def handle_ipp(self):
+        try:
+            with tempfile.TemporaryFile() as body:
+                total = 0
+                chunked = self.headers.get("Transfer-Encoding", "").lower() == "chunked"
+                remaining = int(self.headers.get("Content-Length", "0"))
+                if not chunked and remaining <= 0:
+                    raise ValueError("Content-Length required")
+                while True:
+                    count = int(self.rfile.readline(128).split(b";", 1)[0], 16) if chunked else remaining
+                    if count < 0 or total + count > 512 * 1024 * 1024:
+                        raise ValueError("Job exceeds 512 MiB")
+                    if not count:
+                        break
+                    total += count
+                    while count:
+                        block = self.rfile.read(min(count, 65536))
+                        if not block:
+                            raise ValueError("Incomplete job")
+                        body.write(block)
+                        count -= len(block)
+                    if not chunked:
+                        break
+                    if self.rfile.read(2) != b"\r\n":
+                        raise ValueError("Invalid chunk")
+                body.seek(0)
+                request = IppRequest.from_file(body)
+                try:
+                    response = self.server.behaviour.handle_ipp(request, body)
+                except Exception:
+                    logging.exception("인쇄 작업 실패")
+                    response = IppRequest((1, 1), StatusCodeEnum.server_error_internal_error,
+                                          request.request_id, self.server.behaviour.minimal_attributes())
+                data = response.to_string()
+            self.send_headers(200, "application/ipp", len(data))
+            self.wfile.write(data)
+        except (ValueError, OSError, EOFError) as error:
+            self.send_error(400, str(error))
 
 
 # ---------- 서버 + 큐 등록 ----------
@@ -183,6 +286,7 @@ class PrinterService:
     def __init__(self):
         self.server = None
         self.thread = None
+        self.owns_queue = False
 
     @property
     def running(self):
@@ -191,12 +295,16 @@ class PrinterService:
     def start(self):
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         behaviour = PdfConvertPrinter(directory=str(OUT_DIR), filename_ext="pdf")
-        self.server = IPPServer(("127.0.0.1", PORT), IPPRequestHandler, behaviour)
+        self.server = IPPServer(("127.0.0.1", PORT), RequestHandler, behaviour)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         print(f"[+] IPP: ipp://127.0.0.1:{PORT}/ipp/print")
         print(f"[+] 저장 폴더: {OUT_DIR}")
-        self._register_queue()
+        try:
+            self._register_queue()
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self):
         if self.server:
@@ -207,58 +315,65 @@ class PrinterService:
 
     def _register_queue(self):
         uri = f"ipp://127.0.0.1:{PORT}/ipp/print"
-        # 1차: IPP Everywhere (Mac이 PDF 직송)
-        r = subprocess.run(
-            ["lpadmin", "-p", PRINTER_QUEUE, "-E", "-v", uri,
-             "-m", "everywhere", "-D", PRINTER_DESC,
-             "-o", "printer-is-shared=false"],
-            capture_output=True, text=True,
+        existing = subprocess.run(["/usr/bin/lpstat", "-v", PRINTER_QUEUE],
+                                  capture_output=True, text=True, timeout=15)
+        if existing.returncode == 0:
+            raise RuntimeError(f"기존 '{PRINTER_QUEUE}' 큐가 있습니다. 기존 설정 보호를 위해 등록을 중단했습니다.")
+        result = subprocess.run(
+            ["/usr/sbin/lpadmin", "-p", PRINTER_QUEUE, "-E", "-v", uri,
+             "-m", "everywhere", "-D", PRINTER_DESC, "-o", "printer-is-shared=false"],
+            capture_output=True, text=True, timeout=30,
         )
-        if r.returncode != 0:
-            # 2차: 모델 미지정 fallback (PS로 와도 서버가 변환)
-            r = subprocess.run(
-                ["lpadmin", "-p", PRINTER_QUEUE, "-E", "-v", uri,
-                 "-D", PRINTER_DESC, "-o", "printer-is-shared=false"],
-                capture_output=True, text=True,
-            )
-        if r.returncode == 0:
-            subprocess.run(["cupsenable", PRINTER_QUEUE], capture_output=True)
-            subprocess.run(["cupsaccept", PRINTER_QUEUE], capture_output=True)
-            print(f"[+] 프린터 등록됨: {PRINTER_QUEUE}")
-            notify("프린터 연결됨", f"'{PRINTER_DESC}' 사용 가능")
-        else:
-            print(f"[!] lpadmin 실패: {r.stderr.strip()}")
-            notify("프린터 등록 실패", r.stderr.strip()[:100] or "lpadmin 오류")
+        if result.returncode:
+            raise RuntimeError("프린터 등록 실패 (프린터 관리 권한을 확인하세요): " + result.stderr.strip())
+        self.owns_queue = True
+        notify("프린터 연결됨", f"'{PRINTER_DESC}' 사용 가능")
 
     def _unregister_queue(self):
-        subprocess.run(["lpadmin", "-x", PRINTER_QUEUE], capture_output=True)
+        if not self.owns_queue:
+            return
+        current = subprocess.run(["/usr/bin/lpstat", "-v", PRINTER_QUEUE],
+                                 capture_output=True, text=True, timeout=15)
+        if current.returncode == 0 and current.stdout.strip().endswith(f"ipp://127.0.0.1:{PORT}/ipp/print"):
+            result = subprocess.run(["/usr/sbin/lpadmin", "-x", PRINTER_QUEUE],
+                                    capture_output=True, timeout=15)
+            if result.returncode:
+                notify("큐 정리 실패", "시스템 설정에서 PDF Printer를 확인하세요.")
+        self.owns_queue = False
 
 
 # ---------- 메뉴바 ----------
 
 class MenuBarApp(rumps.App):
     def __init__(self):
-        super().__init__("🖨", quit_button=None)
+        super().__init__(APP_NAME, title="", icon=str(RESOURCE_DIR / "macos/MenuBar.png"),
+                         template=True, quit_button=None)
         self.service = PrinterService()
         self.item_toggle = rumps.MenuItem("프린터 정지", callback=self.on_toggle)
         self.item_folder = rumps.MenuItem("저장 폴더 열기", callback=self.on_folder)
         self.item_quit = rumps.MenuItem("종료", callback=self.on_quit)
         self.menu = [self.item_toggle, self.item_folder, None, self.item_quit]
-        self.service.start()
+        self.start_service()
+
+    def start_service(self):
+        try:
+            self.service.start()
+        except Exception as error:
+            rumps.alert(APP_NAME, str(error))
+        self.title = "" if self.service.running else "!"
+        self.item_toggle.title = "프린터 정지" if self.service.running else "프린터 시작"
 
     def on_toggle(self, _):
         if self.service.running:
             self.service.stop()
-            self.title = "🖨✕"
+            self.title = "!"
             self.item_toggle.title = "프린터 시작"
         else:
-            self.service.start()
-            self.title = "🖨"
-            self.item_toggle.title = "프린터 정지"
+            self.start_service()
 
     def on_folder(self, _):
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["open", str(OUT_DIR)])
+        subprocess.run(["/usr/bin/open", str(OUT_DIR)])
 
     def on_quit(self, _):
         self.service.stop()
@@ -266,4 +381,11 @@ class MenuBarApp(rumps.App):
 
 
 if __name__ == "__main__":
-    MenuBarApp().run()
+    if "--self-test" in sys.argv:
+        from selftest import run
+        run(sys.modules[__name__])
+    elif "--ui-smoke-test" in sys.argv:
+        from selftest import run_ui
+        run_ui(sys.modules[__name__])
+    else:
+        MenuBarApp().run()

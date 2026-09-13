@@ -1,2 +1,4 @@
-rumps
-ippserver
+rumps==0.4.0
+ippserver==0.2
+pyobjc-core==12.2.1
+pyobjc-framework-Cocoa==12.2.1

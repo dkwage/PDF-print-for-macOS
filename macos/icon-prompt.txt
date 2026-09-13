@@ -1,0 +1,3 @@
+Tool: OpenAI built-in image_gen; generated 2026-09-13.
+Create a macOS application icon for PDFPrinter, a local virtual printer that saves print jobs as PDF documents. Square 1024px icon, transparent outside a rounded squircle tile. Refined simple macOS aesthetic, deep teal-blue tile, centered friendly ivory printer with one white sheet emerging in front, coral-red small badge on sheet with exactly 'PDF'. Bold instantly legible silhouette at 32px, ample padding, restrained dimensional shading, no extra lettering, no mockup or background scene. Save the generated asset.
+Original preserved as AppIcon-original.png; iconset resized with macOS sips.
